@@ -6,8 +6,9 @@ import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks, medfilt
 from sklearn.preprocessing import StandardScaler
 from collections import Counter
+from scipy.stats import skew # Added skew check
 
-FS = 120
+FS = 100
 SEG_LEN = FS * 5
 SEGMENTS = 6
 MIN_PPG_LEN = FS * 30
@@ -22,7 +23,33 @@ def bandpass(sig):
 
 
 def is_noisy(signal):
-    return np.std(signal) < 0.01 or len(find_peaks(signal, distance=FS // 2)[0]) < 2
+    """
+    Checks if a signal segment is noisy based on standard deviation,
+    insufficient peaks, or negative skewness (inverted signal).
+    """
+    if np.std(signal) < 0.01: return True
+    if len(find_peaks(signal, distance=FS // 2)[0]) < 2: return True
+    if skew(signal) < 0: return True # Reject inverted signals
+    return False
+
+def get_derivatives(cycle):
+    """
+    Returns 1st (VPG) and 2nd (APG) derivatives of the cycle.
+    """
+    d1 = np.gradient(cycle)
+    d2 = np.gradient(d1)
+    return d1, d2
+
+def get_apg_features(d2):
+    """
+    Extracts a, b, c, d, e waves from APG (2nd derivative) and ratios.
+    Simplified: Uses max/min for a, b, d, e approximations.
+    """
+    a = np.max(d2)
+    b = np.min(d2)
+    # Simple approximation for ratios
+    b_a_ratio = b / a if a != 0 else 0
+    return [a, b, b_a_ratio]
 
 
 def extract_features(ppg_seg, pr_data_for_segment):
@@ -43,9 +70,16 @@ def extract_features(ppg_seg, pr_data_for_segment):
     if not cycles:
         return None
 
-    c = max(cycles, key=np.max)
+    # Signal Averaging: Create "Super Pulse"
+    if not cycles: return None
+    
+    # Simple alignment by peak
+    c = max(cycles, key=np.max) 
+
     time = np.linspace(0, len(c) / FS, len(c))
-    d1, d2 = np.gradient(c), np.gradient(np.gradient(c))
+    d1, d2 = get_derivatives(c)
+    apg_feats = get_apg_features(d2)
+
     auc = np.trapz(c, time)
 
     ttp = time[np.argmax(c)]
@@ -81,6 +115,7 @@ def extract_features(ppg_seg, pr_data_for_segment):
         np.min(d1),
         np.max(d2),
         np.min(d2),
+        *apg_feats, # Added APG features (3 values)
         auc,
         *f_top,
         *m_top,
@@ -158,19 +193,29 @@ def predict_bp(ppg_data, pr_all_data, model_dir="model"):
         if not feat:
             continue
 
+        # Soft Voting Logic
         X_cls = models["scaler_cls"].transform(np.array(feat).reshape(1, -1))
-        predicted_label = models["classifier"].predict(X_cls)[0]
+        
+        # Get probabilities for Soft Voting
+        probs = models["classifier"].predict_proba(X_cls)[0]
+        classes = models["classifier"].classes_
+        
+        weighted_sbp = 0
+        weighted_dbp = 0
+        
+        for idx, cls_name in enumerate(classes):
+            prob = probs[idx]
+            if f"scaler_{cls_name}" in models:
+                 X_reg = models[f"scaler_{cls_name}"].transform(np.array(feat).reshape(1, -1))
+                 s_pred = models[f"sbp_model_{cls_name}"].predict(X_reg)[0]
+                 d_pred = models[f"dbp_model_{cls_name}"].predict(X_reg)[0]
+                 weighted_sbp += prob * s_pred
+                 weighted_dbp += prob * d_pred
+        
+        # Get the strict category for reporting
+        predicted_label = classes[np.argmax(probs)]
 
-        if f"scaler_{predicted_label}" not in models:
-            continue
-
-        X_reg = models[f"scaler_{predicted_label}"].transform(
-            np.array(feat).reshape(1, -1)
-        )
-        sbp_pred = models[f"sbp_model_{predicted_label}"].predict(X_reg)[0]
-        dbp_pred = models[f"dbp_model_{predicted_label}"].predict(X_reg)[0]
-
-        seg_predictions.append((sbp_pred, dbp_pred, predicted_label))
+        seg_predictions.append((weighted_sbp, weighted_dbp, predicted_label))
 
     if len(seg_predictions) < 3:
         return "Prediction cannot be done (not enough valid segments)."

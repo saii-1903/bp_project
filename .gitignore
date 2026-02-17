@@ -2,3 +2,7 @@
 __pycache__/
 *.pkl
 modelsky/
+hyper_only/
+training_data/
+*.csv
+old_data_120hz/

@@ -9,7 +9,7 @@ from scipy.signal import butter, filtfilt, find_peaks, medfilt
 from scipy.fft import fft
 from scipy.stats import entropy, kurtosis
 
-FS = 120
+FS = 100
 SEGMENT_SECONDS = 5
 SEGMENT_SAMPLES = FS * SEGMENT_SECONDS
 SEGMENTS_PER_FILE = 6
