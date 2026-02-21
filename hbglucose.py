@@ -19,7 +19,7 @@ from sklearn.linear_model import RANSACRegressor # Added RANSAC for robust regre
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Constants
-FS = 100
+FS = 200
 SEGMENT_SECONDS = 5
 SEGMENT_SAMPLES = FS * SEGMENT_SECONDS
 SEGMENTS_PER_FILE = 6
@@ -63,7 +63,7 @@ def extract_features(signal, fs=FS):
 
     d1 = np.gradient(cycle)
     d2 = np.gradient(d1)
-    auc = np.trapz(cycle, time)
+    auc = np.trapezoid(cycle, time)
     pw = time[-1]
     ttp_idx = np.argmax(cycle)
     ttp = time[ttp_idx]
@@ -143,11 +143,8 @@ def load_data_from_json_files(input_dir):
             feats = extract_features(seg)
             if feats is None:
                 continue
-            
-            # Interaction Features: Age * Gender
-            interaction = age * gender
-            full_feat = feats + [age, gender, interaction]
-            segment_features.append(full_feat)
+
+            segment_features.append(feats)
 
         if len(segment_features) < 3:
             logging.warning(f"Not enough valid segments in {file_path}. Skipping.")

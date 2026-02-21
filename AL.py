@@ -9,7 +9,7 @@ from scipy.signal import butter, filtfilt, find_peaks, medfilt
 from scipy.fft import fft
 from scipy.stats import entropy, kurtosis
 
-FS = 100
+FS = 200
 SEGMENT_SECONDS = 5
 SEGMENT_SAMPLES = FS * SEGMENT_SECONDS
 SEGMENTS_PER_FILE = 6
@@ -50,7 +50,7 @@ def extract_features(signal):
     time = np.linspace(0, len(cycle) / FS, len(cycle))
     d1 = np.gradient(cycle)
     d2 = np.gradient(d1)
-    auc = np.trapz(cycle, time)
+    auc = np.trapezoid(cycle, time)
     pw = time[-1]
     ttp = time[np.argmax(cycle)]
     tdp = pw - ttp

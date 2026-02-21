@@ -8,7 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from collections import Counter
 from scipy.stats import skew # Added skew check
 
-FS = 100
+FS = 200
 SEG_LEN = FS * 5
 SEGMENTS = 6
 MIN_PPG_LEN = FS * 30
@@ -80,7 +80,7 @@ def extract_features(ppg_seg, pr_data_for_segment):
     d1, d2 = get_derivatives(c)
     apg_feats = get_apg_features(d2)
 
-    auc = np.trapz(c, time)
+    auc = np.trapezoid(c, time)
 
     ttp = time[np.argmax(c)]
     tdp = time[-1] - ttp if time[-1] - ttp != 0 else 1e-6
