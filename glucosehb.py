@@ -13,7 +13,7 @@ from scipy.fft import fft
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Constants
-FS = 100
+FS = 200
 SEGMENT_SECONDS = 5
 SEGMENT_SAMPLES = FS * SEGMENT_SECONDS
 SEGMENTS_PER_FILE = 6
