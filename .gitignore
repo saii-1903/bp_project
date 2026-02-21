@@ -1,10 +1,28 @@
-27may/
-__pycache__/
-*.pkl
+# Training data — never commit
+data/
 modelsky/
 hyper_only/
 training_data/
-*.csv
 old_data_120hz/
+27may/
 
+# Excluded scripts
+AL.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temp / scan files
+scan*.txt
+test_out.txt
+
+# Binary model artifacts (large)
+*.pkl
+*.joblib
+
+# Misc
+*.csv
 *.pdf

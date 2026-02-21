@@ -549,16 +549,14 @@ class HydrationDashboard(ctk.CTk):
                 else C["hydration_red"]
             )
 
-            # PPG waveform buffer — always collect if pleth_wave is valid
-            # The watch sends pleth_wave=0 only when completely off.
-            # Collect even with low/zero PI; quality filter happens in analysis.
+            # PPG waveform buffer — collect only genuinely valid pleth_wave values.
+            # pleth_wave == 0 means the device signals invalid data — skip, never fabricate.
+            # (Removed ADC fallback: abs(adc) % 100 produces meaningless values.)
             pleth_val = pkt.pleth_wave
-            if pleth_val == 0 and pkt.adc_sample != 0:
-                # Fallback: normalise ADC to 1-100 range for compatibility
-                pleth_val = max(1, min(100, abs(pkt.adc_sample) % 100))
             if pleth_val > 0:
                 self._pleth_buf.append(pleth_val)
                 self._raw_pleth_for_analysis.append(pleth_val)
+
 
             # Timestamp
             if self._session_start:
@@ -570,10 +568,10 @@ class HydrationDashboard(ctk.CTk):
             self._update_ppg_graph()
 
         # --- Simple continuous collect → analyse loop ---
-        # Always collecting. As soon as we have enough data, fire analysis.
-        # While analysis runs in background we keep collecting.
-        analysis_rate = cfg.SAMPLING_RATE_HZ
-        window_samples = int(cfg.FEATURE_WINDOW_SECONDS * analysis_rate)  # 6000
+        # Fix 5: Use the measured rate (not hardcoded 200Hz).
+        # If device is at 100Hz, we need 3000 samples for 30s — not 6000.
+        analysis_rate  = getattr(self, '_measured_hz', cfg.SAMPLING_RATE_HZ)
+        window_samples = int(cfg.FEATURE_WINDOW_SECONDS * analysis_rate)
 
         data_len = len(self._raw_pleth_for_analysis)
 
@@ -594,12 +592,12 @@ class HydrationDashboard(ctk.CTk):
                 )
 
         # --- Accumulate → analyse ---
-        # Samples persist across connections. Fire analysis the INSTANT
-        # we cross the 6000-sample threshold, and again every 6000 new samples
-        # (full 30s window) — matching what the model was trained on.
+        # Fix 6: Re-analyse every ~5s of new samples once the initial window is collected.
+        # Previously fired only every full 30s window — far too infrequent for a live dashboard.
         if data_len >= window_samples and not self._analysis_running:
             samples_since_last = data_len - self._last_analysis_len
-            if samples_since_last >= window_samples or self._last_analysis_len == 0:
+            update_every = int(analysis_rate * 5)   # 5s worth of new samples
+            if samples_since_last >= update_every or self._last_analysis_len == 0:
                 self._run_analysis()
                 self._last_analysis_len = data_len
 
@@ -757,8 +755,10 @@ class HydrationDashboard(ctk.CTk):
                 print("DEBUG: Running multi-vital inference...")
                 seg = raw_norm[-window_samples:]
                 if self._session_start and len(self._raw_pleth_for_analysis) > 0:
-                    elapsed_s = max(1.0, time.time() - self._session_start)
+                    elapsed_s   = max(1.0, time.time() - self._session_start)
                     actual_rate = len(self._raw_pleth_for_analysis) / elapsed_s
+                    # Fix 5: persist measured rate so _poll_queue uses it for window threshold
+                    self._measured_hz = actual_rate
                     print(f"DEBUG: Actual measured rate: {actual_rate:.1f} Hz")
                 else:
                     actual_rate = fs

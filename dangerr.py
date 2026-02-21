@@ -93,8 +93,8 @@ def extract_features(ppg_seg, pr_data_for_segment):
     f_top = freqs[pks][top_idx] if len(top_idx) >= 3 else [0] * 3
     m_top = fft_vals[pks][top_idx] if len(top_idx) >= 3 else [0] * 3
 
-    ibi = np.diff(peaks) / FS if len(peaks) > 1 else [0]
-    hrv = np.std(ibi)
+    ibi = np.diff(peaks) / FS if len(peaks) > 1 else np.array([0.0])
+    hrv = float(np.std(ibi))
 
     if len(pr_data_for_segment) > 0:
         pr_mean = np.nanmean(pr_data_for_segment)
@@ -106,6 +106,22 @@ def extract_features(ppg_seg, pr_data_for_segment):
     else:
         pr_mean, pr_std = 0.0, 0.0
 
+    # ── Fix 4: new vascular / HRV features ───────────────────────────────
+    peak_idx  = np.argmax(c)
+    post_peak = c[peak_idx:]
+    notch_mins, _ = find_peaks(-post_peak)
+    ri  = float(post_peak[notch_mins[0]] / (np.max(c) + 1e-9)) if len(notch_mins) > 0 else 0.0
+    aix = float((post_peak[notch_mins[0]] - np.max(c)) / (np.max(c) + 1e-9)) if len(notch_mins) > 0 else 0.0
+    large_si = float(0.1 / (ttp + 1e-9))
+    if len(ibi) > 1:
+        rmssd = float(np.sqrt(np.mean(np.diff(ibi) ** 2)))
+        pnn50 = float(np.sum(np.abs(np.diff(ibi)) > 0.05) / max(len(ibi) - 1, 1))
+    else:
+        rmssd, pnn50 = 0.0, 0.0
+    above_half = np.where(c >= np.max(c) * 0.5)[0]
+    pw50 = float(len(above_half) / FS) if len(above_half) > 0 else 0.0
+    # ─────────────────────────────────────────────────────────────────────
+
     return [
         np.max(c),
         time[-1],
@@ -115,17 +131,23 @@ def extract_features(ppg_seg, pr_data_for_segment):
         np.min(d1),
         np.max(d2),
         np.min(d2),
-        *apg_feats, # Added APG features (3 values)
-        auc,
-        *f_top,
-        *m_top,
-        hrv,
-        np.mean(ppg_seg),
-        np.std(ppg_seg),
-        np.max(ppg_seg),
-        np.min(ppg_seg),
-        pr_mean,
-        pr_std,
+        *apg_feats,       # 8-10
+        auc,              # 11
+        *f_top,           # 12-14
+        *m_top,           # 15-17
+        hrv,              # 18
+        np.mean(ppg_seg), # 19
+        np.std(ppg_seg),  # 20
+        np.max(ppg_seg),  # 21
+        np.min(ppg_seg),  # 22
+        pr_mean,          # 23
+        pr_std,           # 24
+        ri,               # 25 Reflection Index
+        aix,              # 26 Augmentation Index
+        large_si,         # 27 Large Artery Stiffness Index
+        rmssd,            # 28 RMSSD
+        pnn50,            # 29 pNN50
+        pw50,             # 30 Pulse Width at 50%
     ]
 
 
@@ -232,32 +254,17 @@ def predict_bp(ppg_data, pr_all_data, model_dir="model"):
     if inconsistent_sbp >= 3 or inconsistent_dbp >= 3:
         return "Prediction cannot be done (inconsistent segment predictions)."
 
-    # --- Final averaging ---
+    # Fix 1: Remove PR override — trust the model output directly
     final_sbp = np.mean(sbp_values)
     final_dbp = np.mean(dbp_values)
     category = Counter([p[2] for p in seg_predictions]).most_common(1)[0][0]
-
-    # --- PR-based Adjustment ---
-    average_pr = np.nanmean(pr_derived_array)
-    sbp_units = int(final_sbp) % 10
-
-    if 70 <= average_pr < 75:
-        final_sbp = 110 + sbp_units
-    elif 75 <= average_pr < 80:
-        final_sbp = 115 + sbp_units
-    elif 80 <= average_pr < 85:
-        final_sbp = 120 + sbp_units
-    elif 85 <= average_pr < 90:
-        final_sbp = 125 + sbp_units
-    elif average_pr > 90 and final_sbp < 100:
-        final_sbp = 110 + sbp_units
 
     return {
         "predicted_category": category,
         "predicted_sbp": round(final_sbp),
         "predicted_dbp": round(final_dbp),
-        "average_pr": round(average_pr),
     }
+
 
 
 if __name__ == "__main__":

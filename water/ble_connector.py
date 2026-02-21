@@ -189,12 +189,11 @@ class BerryBLEConnector:
             
             while not self._stop_event.is_set() and self._client.is_connected:
                 if time.time() - last_ping > 1.5:
-                    # Send command to reset inactivity timer
-                    cmd = cfg.BERRY_CMD_200HZ if ping_tiggle else cfg.BERRY_CMD_ADC_ORIGINAL
-                    await self._async_send(cmd)
-                    
-                    ping_tiggle = not ping_tiggle
-                    last_ping = time.time()
+                    # Fix 7: Use CMD_SW_VERSION as keep-alive ping.
+                    # It's a true no-op (returns a version string only) and
+                    # won't interrupt streaming or change the device's 200Hz state.
+                    await self._async_send(cfg.BERRY_CMD_SW_VERSION)
+
                     
                 await asyncio.sleep(0.1)
 
@@ -272,10 +271,11 @@ class BerryBLEConnector:
                 self.packets_bad += 1
 
     def _on_disconnect(self, client):
-        """BLE disconnection callback."""
-        # Note: Do not switch to DISCONNECTED here if we are auto-reconnecting.
-        # The main loop will handle the state transition when it catches the disconnect.
-        pass
+        """BLE disconnection callback — fires on unexpected device drop."""
+        # Signal DISCONNECTED so the GUI updates immediately.
+        # The _run_loop auto-reconnect logic will then transition to CONNECTING.
+        self._set_state(STATE_DISCONNECTED)
+
 
     def _run_loop(self, address: str):
         """Background thread: run the asyncio event loop with auto-reconnect."""

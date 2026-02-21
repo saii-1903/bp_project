@@ -8,12 +8,17 @@ from glob import glob
 from scipy.signal import butter, filtfilt, find_peaks, medfilt
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import train_test_split, GridSearchCV # Added GridSearchCV
+from sklearn.model_selection import train_test_split, GroupShuffleSplit, RandomizedSearchCV
 from sklearn.metrics import accuracy_score, mean_absolute_error, r2_score
-import psutil # For system memory usage, install with: pip install psutil
-from scipy.stats import skew # Added skew for signal quality check
+import psutil
+from scipy.stats import skew
+try:
+    from xgboost import XGBRegressor
+    USE_XGB = True
+except ImportError:
+    from sklearn.ensemble import RandomForestRegressor
+    USE_XGB = False
+    print("WARNING: xgboost not installed — falling back to RandomForest. Run: pip install xgboost")
 
 FS = 200 
 SEG_LEN = FS * 5 
@@ -112,84 +117,109 @@ def calculate_pr_from_ppg(ppg_full, sampling_rate=FS, segment_duration=1):
 
 def extract_features(ppg_seg, pr_data_for_segment):
     """
-    Extracs various time-domain, frequency-domain, and morphological features
-    from a PPG signal segment and its corresponding PR data.
-    `pr_data_for_segment` should be an array of PR values covering the `ppg_seg` duration.
-    Handles NaN values in PR data.
+    Extracts time-domain, frequency-domain, morphological, and HRV features
+    from a PPG segment. Returns 31 features (25 original + 6 new).
     """
     if len(ppg_seg) < FS or is_noisy(ppg_seg):
         return None
-    
-    ppg_seg = bandpass(ppg_seg)
-    norm = (ppg_seg - np.min(ppg_seg)) / (np.max(ppg_seg) - np.min(ppg_seg) + 1e-6)
+
+    ppg_filt = bandpass(ppg_seg)
+    norm = (ppg_filt - np.min(ppg_filt)) / (np.max(ppg_filt) - np.min(ppg_filt) + 1e-6)
     peaks, _ = find_peaks(norm, distance=int(FS * 0.4))
-    mins, _ = find_peaks(-norm, distance=int(FS * 0.3))
+    mins,  _ = find_peaks(-norm, distance=int(FS * 0.3))
 
     cycles = [norm[mins[mins < p][-1]:mins[mins > p][0]] for p in peaks
               if len(mins[mins < p]) > 0 and len(mins[mins > p]) > 0]
-    if not cycles: return None
-    
-    # Signal Averaging: Create "Super Pulse"
-    if not cycles: return None
-    
-    # Align cycles by their peak
-    max_len = max(len(c) for c in cycles)
-    aligned_cycles = []
-    for cyc in cycles:
-        pad_len = max_len - len(cyc)
-        # Simple padding for length match - improved alignment would use cross-correlation
-        # For now, we use the longest cycle as reference 'c' logic below
-        pass 
+    if not cycles:
+        return None
 
-    # For simplicity and robustness in this iteration, we keep the 'best' cycle logic 
-    # but add the APG/VPG features requested. 
-    # True signal averaging requires precise phase alignment.
-    c = max(cycles, key=np.max) 
-    
-    time = np.linspace(0, len(c)/FS, len(c))
+    c = max(cycles, key=np.max)          # best-quality pulse cycle
+    time = np.linspace(0, len(c) / FS, len(c))
     d1, d2 = get_derivatives(c)
-    apg_feats = get_apg_features(d2)
+    apg_feats = get_apg_features(d2)     # [a, b, b/a]
 
-    auc = np.trapezoid(c, time)
-    ttp = time[np.argmax(c)]
-    tdp = time[-1] - ttp
-    ratio = ttp / tdp if tdp else 0
-    
-    fft_vals = np.abs(np.fft.fft(c)[:len(c)//2])
-    freqs = np.fft.fftfreq(len(c), 1 / FS)[:len(c)//2]
-    pks, _ = find_peaks(fft_vals, distance=5)
-    
-    # Handle case where fewer than 3 peaks are found in FFT
-    f_top = [0.0]*3
-    m_top = [0.0]*3
+    auc   = np.trapezoid(c, time)
+    ttp   = time[np.argmax(c)]
+    tdp   = time[-1] - ttp if (time[-1] - ttp) != 0 else 1e-6
+    ratio = ttp / tdp
+
+    fft_vals = np.abs(np.fft.fft(c)[:len(c) // 2])
+    freqs    = np.fft.fftfreq(len(c), 1 / FS)[:len(c) // 2]
+    pks, _   = find_peaks(fft_vals, distance=5)
+    f_top    = [0.0] * 3
+    m_top    = [0.0] * 3
     if len(pks) > 0:
-        top_idx = np.argsort(fft_vals[pks])[-3:] # Get indices of up to 3 largest magnitudes
-        # Ensure we always get 3 values, padding with 0 if fewer than 3 peaks
-        f_top_temp = freqs[pks][top_idx].tolist()
-        m_top_temp = fft_vals[pks][top_idx].tolist()
-        f_top = f_top_temp + [0.0]*(3-len(f_top_temp))
-        m_top = m_top_temp + [0.0]*(3-len(m_top_temp))
-    
-    ibi = np.diff(peaks)/FS if len(peaks) > 1 else [0]
-    hrv = np.std(ibi)
+        top_idx  = np.argsort(fft_vals[pks])[-3:]
+        f_top_t  = freqs[pks][top_idx].tolist()
+        m_top_t  = fft_vals[pks][top_idx].tolist()
+        f_top    = f_top_t  + [0.0] * (3 - len(f_top_t))
+        m_top    = m_top_t  + [0.0] * (3 - len(m_top_t))
 
-    # Calculate PR mean and std, ignoring NaN values
+    ibi = np.diff(peaks) / FS if len(peaks) > 1 else np.array([0.0])
+    hrv = float(np.std(ibi))
+
+    # PR stats
     if len(pr_data_for_segment) > 0:
-        pr_mean = np.nanmean(pr_data_for_segment)
-        pr_std = np.nanstd(pr_data_for_segment)
-        # Handle cases where all values were NaN (mean/std become NaN) or std is very small
+        pr_mean = float(np.nanmean(pr_data_for_segment))
+        pr_std  = float(np.nanstd(pr_data_for_segment))
         if np.isnan(pr_mean): pr_mean = 0.0
-        if np.isnan(pr_std) or pr_std < 0.1: pr_std = 2.0 
+        if np.isnan(pr_std) or pr_std < 0.1: pr_std = 2.0
     else:
         pr_mean, pr_std = 0.0, 0.0
 
+    # ── NEW: vascular / HRV features (Fix 4) ─────────────────────────────
+    # Reflection Index: amplitude at dicrotic notch / systolic peak
+    # Approximate dicrotic notch as the first local min AFTER systolic peak
+    peak_idx   = np.argmax(c)
+    post_peak  = c[peak_idx:]
+    notch_mins, _ = find_peaks(-post_peak)
+    ri  = float(post_peak[notch_mins[0]] / (np.max(c) + 1e-9)) if len(notch_mins) > 0 else 0.0
+
+    # Augmentation Index (AIx): (c_notch - c_peak) / c_peak
+    aix = float((post_peak[notch_mins[0]] - np.max(c)) / (np.max(c) + 1e-9)) if len(notch_mins) > 0 else 0.0
+
+    # Large Artery Stiffness Index (simplified): 0.1 / time-to-peak
+    large_si = float(0.1 / (ttp + 1e-9))
+
+    # RMSSD and pNN50 (beat-to-beat HRV)
+    if len(ibi) > 1:
+        rmssd = float(np.sqrt(np.mean(np.diff(ibi) ** 2)))
+        pnn50 = float(np.sum(np.abs(np.diff(ibi)) > 0.05) / max(len(ibi) - 1, 1))
+    else:
+        rmssd, pnn50 = 0.0, 0.0
+
+    # Pulse Width at 50% amplitude
+    half_max   = np.max(c) * 0.5
+    above_half = np.where(c >= half_max)[0]
+    pw50 = float(len(above_half) / FS) if len(above_half) > 0 else 0.0
+    # ─────────────────────────────────────────────────────────────────────
+
     return [
-        np.max(c), time[-1], ttp, ratio,
-        np.max(d1), np.min(d1), np.max(d2), np.min(d2),
-        *apg_feats, # Added APG features (3 values)
-        auc, *f_top, *m_top, hrv,
-        np.mean(ppg_seg), np.std(ppg_seg), np.max(ppg_seg), np.min(ppg_seg),
-        pr_mean, pr_std
+        float(np.max(c)),          # 0  systolic amplitude
+        float(time[-1]),           # 1  pulse duration
+        float(ttp),                # 2  time-to-peak
+        float(ratio),              # 3  ttp/tdp ratio
+        float(np.max(d1)),         # 4  max VPG
+        float(np.min(d1)),         # 5  min VPG
+        float(np.max(d2)),         # 6  max APG
+        float(np.min(d2)),         # 7  min APG
+        *apg_feats,                # 8-10 APG a, b, b/a
+        float(auc),                # 11 area under curve
+        *f_top,                    # 12-14 top FFT freqs
+        *m_top,                    # 15-17 top FFT magnitudes
+        float(hrv),                # 18 HRV std
+        float(np.mean(ppg_filt)),  # 19 signal mean
+        float(np.std(ppg_filt)),   # 20 signal std
+        float(np.max(ppg_filt)),   # 21 signal max
+        float(np.min(ppg_filt)),   # 22 signal min
+        float(pr_mean),            # 23 PR mean
+        float(pr_std),             # 24 PR std
+        ri,                        # 25 Reflection Index
+        aix,                       # 26 Augmentation Index
+        large_si,                  # 27 Large Artery Stiffness Index
+        rmssd,                     # 28 RMSSD
+        pnn50,                     # 29 pNN50
+        pw50,                      # 30 Pulse Width at 50%
     ]
 
 def get_bp_label(sbp, dbp):
@@ -210,7 +240,7 @@ def load_data(folder):
     and assigns BP labels. Prioritizes 'PRAllData' from JSON if available and valid.
     Filters out invalid PR values.
     """
-    X, Y_sbp, Y_dbp, labels = [], [], [], []
+    X, Y_sbp, Y_dbp, labels, patient_ids = [], [], [], [], []
     files = glob(os.path.join(folder, "*.json"))
     
     initial_mem = get_current_memory_usage()
@@ -287,197 +317,146 @@ def load_data(folder):
         
         ppg = medfilt(np.array(ppg_raw), kernel_size=3)
 
-        # Extract features from 5-second segments
-        current_file_features = []
+        # Fix 2: ONE ROW PER SEGMENT — do NOT average across segments.
+        # This gives 6× more training rows and matches inference behavior exactly.
+        patient_id = d.get("PatientID") or d.get("Name") or os.path.basename(path)
         for i in range(SEGMENTS):
-            start_idx = i * SEG_LEN
-            end_idx = start_idx + SEG_LEN
-            seg_ppg = ppg[start_idx:end_idx]
-            
-            # Get corresponding PR values for this 5-second segment, handling potential NaNs
-            pr_seg_for_feat = pr_derived_array[i * (SEG_LEN // FS) : (i + 1) * (SEG_LEN // FS)]
-
-            feat = extract_features(seg_ppg, pr_seg_for_feat)
+            seg_ppg = ppg[i * SEG_LEN : (i + 1) * SEG_LEN]
+            pr_seg  = pr_derived_array[i * (SEG_LEN // FS) : (i + 1) * (SEG_LEN // FS)]
+            feat = extract_features(seg_ppg, pr_seg)
             if feat:
-                current_file_features.append(feat)
-        
-        # Only include if at least one valid segment was found
-        if current_file_features:
-            # Average features across all valid segments for this recording
-            avg_feat_for_file = np.mean(current_file_features, axis=0)
-            X.append(avg_feat_for_file)
-            Y_sbp.append(sbp)
-            Y_dbp.append(dbp)
-            labels.append(label)
+                X.append(feat)
+                Y_sbp.append(sbp)
+                Y_dbp.append(dbp)
+                labels.append(label)
+                patient_ids.append(patient_id)
 
-    print(f"Loaded data for {len(X)} valid recordings.")
+    print(f"Loaded {len(X)} segment rows from files (Fix 2: per-segment training).")
     print(f"Memory Usage After Data Loading: {get_current_memory_usage():.2f} MB")
-    return np.array(X), np.array(Y_sbp), np.array(Y_dbp), np.array(labels)
+    return np.array(X), np.array(Y_sbp), np.array(Y_dbp), np.array(labels), np.array(patient_ids)
 
-def train_models(X, Y_sbp, Y_dbp, labels, output_dir="model"):
+def train_models(X, Y_sbp, Y_dbp, labels, patient_ids, output_dir="model"):
     """
     Trains classification and regression models and saves them.
+    Fix 5: Uses XGBoost regressors with RandomizedSearchCV.
+    Fix 6: GroupShuffleSplit by patient_id for honest subject-independent evaluation.
     """
     os.makedirs(output_dir, exist_ok=True)
-    training_start_mem = get_current_memory_usage()
-    print(f"Memory Usage Before Training: {training_start_mem:.2f} MB")
+    print(f"Memory Before Training: {get_current_memory_usage():.2f} MB")
 
-    # --- 1. Train Classifier ---
-    print("\n--- Training Classifier ---")
-    X_train_cls, X_test_cls, y_train_cls, y_test_cls = train_test_split(
-        X, labels, test_size=0.2, random_state=42, stratify=labels
-    )
-    
-    # --- COMBINED SCALER: Fit ONE StandardScaler on the entire training data ---
+    # ── Fix 6: Subject-independent split ─────────────────────────────────
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(gss.split(X, labels, groups=patient_ids))
+    X_train, X_test   = X[train_idx], X[test_idx]
+    l_train, l_test   = labels[train_idx], labels[test_idx]
+    print(f"Subject-independent split: {len(train_idx)} train rows, {len(test_idx)} test rows")
+    print(f"Unique patients in test:  {len(set(patient_ids[test_idx]))}")
+
+    # ── Global Scaler ─────────────────────────────────────────────────────
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_cls)
-    X_test_cls_scaled = scaler.transform(X_test_cls)
-    global_scaler_path = os.path.join(output_dir, "global_feature_scaler.pkl")
-    joblib.dump(scaler, global_scaler_path)
-    print(f"INFO: Saved global_feature_scaler.pkl (size: {os.path.getsize(global_scaler_path) / 1024:.2f} KB)")
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc  = scaler.transform(X_test)
+    joblib.dump(scaler, os.path.join(output_dir, "global_feature_scaler.pkl"))
+    print(f"Saved global_feature_scaler.pkl  ({X_train.shape[1]} features)")
 
-
-    # Logistic Regression for classification with balanced class weights
+    # ── 1. Classifier (Logistic Regression) ──────────────────────────────
+    print("\n--- Training Classifier ---")
     clf = LogisticRegression(max_iter=1000, class_weight='balanced', solver='liblinear')
-    clf.fit(X_train_scaled, y_train_cls)
-    classifier_path = os.path.join(output_dir, "classifier.pkl")
-    joblib.dump(clf, classifier_path)
+    clf.fit(X_train_sc, l_train)
+    print(f"Classifier Accuracy (subject-independent test): "
+          f"{accuracy_score(l_test, clf.predict(X_test_sc)):.4f}")
+    clf_path = os.path.join(output_dir, "classifier.pkl")
+    joblib.dump(clf, clf_path)
+    print(f"Saved classifier.pkl")
 
-    y_pred_cls = clf.predict(X_test_cls_scaled)
-    cls_accuracy = accuracy_score(y_test_cls, y_pred_cls)
-    
-    print("\n--- Classifier Model Info ---")
-    print(f"Model Type: {type(clf).__name__}")
-    print(f"Number of Features used: {clf.n_features_in_}")
-    print(f"Classes: {clf.classes_}")
-    print(f"Solver: {clf.solver}")
-    print(f"Max Iterations: {clf.max_iter}")
-    print(f"Classifier Accuracy (Test Set): {cls_accuracy:.4f}")
-    print(f"Saved classifier.pkl (size: {os.path.getsize(classifier_path) / 1024:.2f} KB)")
-    
-    # Print class distribution for verification
-    unique_labels, counts = np.unique(labels, return_counts=True)
-    print("\nOverall Class Distribution in Dataset:")
-    for label, count in zip(unique_labels, counts):
-        print(f"    {label}: {count} samples")
-    print("\nTest Set Class Distribution:")
-    unique_test_labels, test_counts = np.unique(y_test_cls, return_counts=True)
-    for label, count in zip(unique_test_labels, test_counts):
-        print(f"    {label}: {count} samples")
-
-
-    # --- 2. Train Regression Models per Blood Pressure Category ---
-    print("\n--- Training Regression Models per Category ---")
-    total_reg_model_size_combined = 0
-    
-    # Define an ordered list of groups for consistent processing
-    groups_to_train = ["hypo", "normal", "hyper"]
-
-    for group in groups_to_train:
-        print(f"\nTraining for group: {group}")
-        idx = np.where(labels == group)[0]
-        
-        if len(idx) < 10: # Require a minimum number of samples to train
-            print(f"    Not enough data for '{group}' group ({len(idx)} samples). Skipping regression models.")
-            continue
-        
-        X_group = X[idx]
-        Y_sbp_group = Y_sbp[idx]
-        Y_dbp_group = Y_dbp[idx]
-
-        # Use the global scaler to transform group data
-        X_group_scaled = scaler.transform(X_group) # IMPORTANT: Use the single global scaler
-        
-        X_train_reg, X_test_reg, y_train_sbp, y_test_sbp, y_train_dbp, y_test_dbp = train_test_split(
-            X_group_scaled, Y_sbp_group, Y_dbp_group, test_size=0.2, random_state=42
-        )
-
-        # SBP Model with GridSearchCV
-        print(f"    Optimizing SBP model for {group}...")
-        sbp_grid = GridSearchCV(
-            RandomForestRegressor(random_state=42),
-            param_grid={
-                'n_estimators': [50, 100],
-                'max_depth': [None, 10, 20],
-                'min_samples_split': [2, 5]
-            },
-            cv=3, n_jobs=-1, scoring='neg_mean_absolute_error'
-        )
-        sbp_grid.fit(X_train_reg, y_train_sbp)
-        sbp_model = sbp_grid.best_estimator_
-
-        # DBP Model with GridSearchCV
-        print(f"    Optimizing DBP model for {group}...")
-        dbp_grid = GridSearchCV(
-            RandomForestRegressor(random_state=42),
-            param_grid={
-                'n_estimators': [50, 100],
-                'max_depth': [None, 10, 20],
-                'min_samples_split': [2, 5]
-            },
-            cv=3, n_jobs=-1, scoring='neg_mean_absolute_error'
-        )
-        dbp_grid.fit(X_train_reg, y_train_dbp)
-        dbp_model = dbp_grid.best_estimator_
-
-        # --- COMBINE SBP and DBP models for this group into one file ---
-        combined_group_models = {
-            'sbp_model': sbp_model,
-            'dbp_model': dbp_model
+    # ── XGBoost hyperparameter space (Fix 5) ─────────────────────────────
+    if USE_XGB:
+        base_model  = XGBRegressor(random_state=42, n_jobs=-1, verbosity=0)
+        param_space = {
+            'n_estimators':     [100, 200, 300],
+            'max_depth':        [3, 4, 5, 6],
+            'learning_rate':    [0.01, 0.05, 0.1],
+            'subsample':        [0.7, 0.8, 0.9],
+            'colsample_bytree': [0.7, 0.8, 1.0],
+            'reg_alpha':        [0, 0.1, 0.5],
+            'reg_lambda':       [1, 2, 5],
         }
-        combined_model_filename = os.path.join(output_dir, f"{group}_models.pkl")
-        joblib.dump(combined_group_models, combined_model_filename)
-        file_size_kb = os.path.getsize(combined_model_filename) / 1024
-        total_reg_model_size_combined += os.path.getsize(combined_model_filename)
+        print("Using XGBoost regressors.")
+    else:
+        from sklearn.ensemble import RandomForestRegressor
+        base_model  = RandomForestRegressor(random_state=42)
+        param_space = {
+            'n_estimators':     [50, 100, 200],
+            'max_depth':        [None, 10, 20],
+            'min_samples_split':[2, 5],
+        }
+        print("Using RandomForest regressors (xgboost not available).")
 
-        # Evaluate Regression Models
-        y_pred_sbp = sbp_model.predict(X_test_reg)
-        y_pred_dbp = dbp_model.predict(X_test_reg)
+    # ── 2. Group Regression Models ────────────────────────────────────────
+    print("\n--- Training Regression Models per Category ---")
+    total_size = 0
+    for group in ["hypo", "normal", "hyper"]:
+        g_train = train_idx[l_train == group]
+        g_test  = test_idx [l_test  == group]
+        if len(g_train) < 10:
+            print(f"  Skipping '{group}': only {len(g_train)} train rows")
+            continue
+        print(f"\n  {group.upper()}  — {len(g_train)} train / {len(g_test)} test rows")
 
-        mae_sbp = mean_absolute_error(y_test_sbp, y_pred_sbp)
-        r2_sbp = r2_score(y_test_sbp, y_pred_sbp)
-        mae_dbp = mean_absolute_error(y_test_dbp, y_pred_dbp)
-        r2_dbp = r2_score(y_test_dbp, y_pred_dbp)
+        Xg_tr = scaler.transform(X[g_train])
+        Xg_te = scaler.transform(X[g_test])
+        Ysbp_tr, Ydbp_tr = Y_sbp[g_train], Y_dbp[g_train]
+        Ysbp_te, Ydbp_te = Y_sbp[g_test],  Y_dbp[g_test]
 
-        print(f"    --- {group.upper()} SBP/DBP Combined Model Info ({os.path.basename(combined_model_filename)}) ---")
-        print(f"    Combined Model Size: {file_size_kb:.2f} KB")
-        print(f"    SBP Model Type: {type(sbp_model).__name__}")
-        print(f"    SBP Estimators: {sbp_model.n_estimators}")
-        print(f"    SBP Features Used: {sbp_model.n_features_in_}")
-        print(f"    SBP MAE (Test Set): {mae_sbp:.2f}, R2: {r2_sbp:.2f}")
-        
-        print(f"    DBP Model Type: {type(dbp_model).__name__}")
-        print(f"    DBP Estimators: {dbp_model.n_estimators}")
-        print(f"    DBP Features Used: {dbp_model.n_features_in_}")
-        print(f"    DBP MAE (Test Set): {mae_dbp:.2f}, R2: {r2_dbp:.2f}")
+        # SBP
+        sbp_search = RandomizedSearchCV(
+            base_model, param_space, n_iter=30, cv=3,
+            scoring='neg_mean_absolute_error', n_jobs=-1, random_state=42
+        )
+        sbp_search.fit(Xg_tr, Ysbp_tr)
+        sbp_model = sbp_search.best_estimator_
 
-    final_mem = get_current_memory_usage()
-    print(f"\nMemory Usage After Training: {final_mem:.2f} MB")
-    print(f"Total Disk Space for ALL Combined Regression Models: {total_reg_model_size_combined / 1024:.2f} KB")
+        # DBP
+        dbp_search = RandomizedSearchCV(
+            base_model, param_space, n_iter=30, cv=3,
+            scoring='neg_mean_absolute_error', n_jobs=-1, random_state=42
+        )
+        dbp_search.fit(Xg_tr, Ydbp_tr)
+        dbp_model = dbp_search.best_estimator_
 
-    # Calculate total disk space for all models (global scaler, classifier, all combined regressors)
-    total_model_disk_space = 0
-    for file in os.listdir(output_dir):
-        if file.endswith(".pkl"): # Only sum up the .pkl files directly in the output_dir
-            total_model_disk_space += os.path.getsize(os.path.join(output_dir, file))
+        # Evaluate
+        if len(Xg_te) > 0:
+            mae_sbp = mean_absolute_error(Ysbp_te, sbp_model.predict(Xg_te))
+            mae_dbp = mean_absolute_error(Ydbp_te, dbp_model.predict(Xg_te))
+            r2_sbp  = r2_score(Ysbp_te, sbp_model.predict(Xg_te))
+            r2_dbp  = r2_score(Ydbp_te, dbp_model.predict(Xg_te))
+            print(f"  SBP MAE={mae_sbp:.2f} R2={r2_sbp:.2f} | DBP MAE={mae_dbp:.2f} R2={r2_dbp:.2f}")
+        else:
+            print(f"  No test rows for {group} — skipping evaluation")
 
-    print(f"\nTraining complete. Models saved to: {os.path.abspath(output_dir)}")
-    print(f"Total Disk Space for ALL Saved Models (Global Scaler + Classifier + Combined Category Models): {total_model_disk_space / 1024:.2f} KB")
+        combined = {'sbp_model': sbp_model, 'dbp_model': dbp_model}
+        out_path = os.path.join(output_dir, f"{group}_models.pkl")
+        joblib.dump(combined, out_path)
+        sz = os.path.getsize(out_path)
+        total_size += sz
+        print(f"  Saved {group}_models.pkl  ({sz/1024:.1f} KB)")
+
+    print(f"\nDone. Models in: {os.path.abspath(output_dir)}")
+    print(f"Total model size: {total_size/1024:.1f} KB")
+    print(f"Memory After Training: {get_current_memory_usage():.2f} MB")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train BP prediction models from PPG data.")
     parser.add_argument("data_folder", help="Path to the folder containing JSON data files.")
-    parser.add_argument("--output_dir", default="model", 
+    parser.add_argument("--output_dir", default="model",
                         help="Path to the directory to save trained models (default: 'model').")
     args = parser.parse_args()
 
-    # Load data
-    X, Y_sbp, Y_dbp, labels = load_data(args.data_folder)
+    X, Y_sbp, Y_dbp, labels, patient_ids = load_data(args.data_folder)
 
     if len(X) == 0:
-        print("No valid data loaded. Cannot train models. Please check your data folder and JSON files.")
+        print("No valid data loaded. Cannot train models.")
     else:
-        # Train and save models
-        train_models(X, Y_sbp, Y_dbp, labels, args.output_dir)
+        train_models(X, Y_sbp, Y_dbp, labels, patient_ids, args.output_dir)

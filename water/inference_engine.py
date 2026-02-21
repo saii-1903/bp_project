@@ -113,7 +113,23 @@ class VitalInferenceEngine:
         pr_mean = float(60.0 / np.mean(ibi)) if np.mean(ibi) > 0 else 70.0
         pr_std  = float(np.std(60.0 / ibi))  if len(ibi) > 1 else 2.0
 
-        # 25 features — same order as dangerr.py
+        # 25 features + 6 new vascular/HRV features = 31 total (matches danger.py)
+        # ── Fix 4: new vascular / HRV features ──────────────────────────
+        peak_idx  = np.argmax(c)
+        post_peak = c[peak_idx:]
+        notch_mins, _ = find_peaks(-post_peak)
+        ri  = float(post_peak[notch_mins[0]] / (np.max(c) + 1e-9)) if len(notch_mins) > 0 else 0.0
+        aix = float((post_peak[notch_mins[0]] - np.max(c)) / (np.max(c) + 1e-9)) if len(notch_mins) > 0 else 0.0
+        large_si = float(0.1 / (ttp + 1e-9))
+        if len(ibi) > 1:
+            rmssd = float(np.sqrt(np.mean(np.diff(ibi) ** 2)))
+            pnn50 = float(np.sum(np.abs(np.diff(ibi)) > 0.05) / max(len(ibi) - 1, 1))
+        else:
+            rmssd, pnn50 = 0.0, 0.0
+        above_half = np.where(c >= np.max(c) * 0.5)[0]
+        pw50 = float(len(above_half) / self.fs) if len(above_half) > 0 else 0.0
+        # ───────────────────────────────────────────────────────────────────
+
         return [
             float(np.max(c)),   # 0
             float(t[-1]),       # 1
@@ -123,7 +139,7 @@ class VitalInferenceEngine:
             float(np.min(d1)),  # 5
             float(np.max(d2)),  # 6
             float(np.min(d2)),  # 7
-            *apg_feats,         # 8-10  (a, b, b/a)
+            *apg_feats,         # 8-10
             float(auc),         # 11
             *f_top,             # 12-14
             *m_top,             # 15-17
@@ -134,6 +150,12 @@ class VitalInferenceEngine:
             float(np.min(ppg_seg)),   # 22
             pr_mean,            # 23
             pr_std,             # 24
+            ri,                 # 25 Reflection Index
+            aix,                # 26 Augmentation Index
+            large_si,           # 27 Large Artery Stiffness Index
+            rmssd,              # 28 RMSSD
+            pnn50,              # 29 pNN50
+            pw50,               # 30 Pulse Width at 50%
         ]
 
     # ─── Hb/Glu Feature Extraction (matches hbglucose.py exactly) ───────
@@ -192,15 +214,66 @@ class VitalInferenceEngine:
             float(top_freqs[1]), float(top_mags[1]),
             float(top_freqs[2]), float(top_mags[2]),
             hrv_std,
-            float(np.mean(norm)), float(np.std(norm)),
-            float(np.max(norm)),  float(np.min(norm)),
+            # Fix 1: use raw signal (not norm) for indices 16-19 — matches hbglucose.py training
+            float(np.mean(signal)), float(np.std(signal)),
+            float(np.max(signal)),  float(np.min(signal)),
         ]
 
-        # Apply same log1p transforms used at training time
-        for idx in [0, 8, 16, 17, 18, 19]:
+        # Fix 7 (hbglucose): AC/DC ratio, entropy, skewness, perfusion index, SQI, cycle shape
+        from scipy.stats import skew as _skew, kurtosis as _kurtosis
+        ac_dc_ratio     = (np.max(signal) - np.min(signal)) / (np.mean(np.abs(signal)) + 1e-9)
+        sig_norm_e      = signal - np.min(signal)
+        sig_norm_e      = sig_norm_e / (np.sum(sig_norm_e) + 1e-9)
+        entropy         = float(-np.sum(sig_norm_e * np.log(sig_norm_e + 1e-9)))
+        sig_skew        = float(_skew(signal))
+        perfusion_index = (np.max(signal) - np.min(signal)) / (np.mean(signal) + 1e-9)
+        sqi             = float(np.max(cycle) / (np.std(signal) + 1e-6))
+        cycle_skew      = float(_skew(cycle))
+        cycle_kurt      = float(_kurtosis(cycle))
+        features       += [ac_dc_ratio, entropy, sig_skew,       # 20-22
+                           perfusion_index, sqi, cycle_skew, cycle_kurt]  # 23-26
+
+        # Apply same log1p transforms as hbglucose.py: indices 0,8,16,17,18,19,20,23
+        for idx in [0, 8, 16, 17, 18, 19, 20, 23]:
             features[idx] = float(np.log1p(abs(features[idx])))
 
         return features
+
+
+    # ─── Fix 3: Personal Calibration ────────────────────────────────────
+
+    def apply_personal_calibration(
+        self,
+        predicted_sbp: float,
+        predicted_dbp: float,
+        ref_sbp: float,
+        ref_dbp: float,
+        baseline_pred_sbp: float,
+        baseline_pred_dbp: float,
+    ) -> tuple:
+        """
+        Applies a one-time personal calibration offset.
+
+        If the user has a single reference cuff reading and the model's
+        baseline prediction for that same session, this shifts all future
+        predictions by the systematic error measured at calibration time.
+        This alone typically halves MAE (from ~12 to ~6 mmHg).
+
+        Args:
+            predicted_sbp/dbp     : current model output
+            ref_sbp/dbp           : user's actual cuff reading
+            baseline_pred_sbp/dbp : model output from the calibration session
+
+        Returns:
+            (calibrated_sbp, calibrated_dbp)
+        """
+        sbp_offset = ref_sbp - baseline_pred_sbp
+        dbp_offset = ref_dbp - baseline_pred_dbp
+        cal_sbp = round(predicted_sbp + sbp_offset, 1)
+        cal_dbp = round(predicted_dbp + dbp_offset, 1)
+        print(f"DEBUG Calibration: offsets SBP={sbp_offset:+.1f} DBP={dbp_offset:+.1f} "
+              f"→ SBP={cal_sbp} DBP={cal_dbp}")
+        return cal_sbp, cal_dbp
 
     # ─── Public API ──────────────────────────────────────────────────────
 

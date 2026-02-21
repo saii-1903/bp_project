@@ -38,8 +38,9 @@ RIIV_AMPLITUDE = 0.04                # Baseline (DC) modulation depth
 RIAV_AMPLITUDE = 0.06                # Pulse-amplitude modulation depth
 
 # ─── Signal Processing ──────────────────────────────────────────────
-BANDPASS_LOW_HZ = 0.5                # Highpass cut-off
-BANDPASS_HIGH_HZ = 5.0               # Lowpass cut-off
+BANDPASS_LOW_HZ  = 0.4               # Highpass cut-off (aligned with ML training scripts)
+BANDPASS_HIGH_HZ = 11.0              # Lowpass cut-off  (aligned with ML training scripts)
+
 BANDPASS_ORDER = 5                   # Elliptic filter order
 BANDPASS_RIPPLE_DB = 0.1             # Passband ripple
 BANDPASS_ATTENUATION_DB = 40         # Stopband attenuation
@@ -51,7 +52,8 @@ MIN_PEAKS_PER_WINDOW = 5             # Minimum beats to accept a window
 PEAK_DISTANCE_SAMPLES = 20           # Minimum distance between peaks
 
 # ─── Hydration Engine ───────────────────────────────────────────────
-BASELINE_WINDOW_MINUTES = 0.5          # Initial window for personal baseline (30s)
+BASELINE_WINDOW_MINUTES = 2.0          # Initial window for personal baseline (~2 min; 30s was too short)
+
 EWMA_SPAN_MINUTES = 5               # EWMA smoothing span
 TREND_WINDOW_POINTS = 10             # Sliding window for slope estimation
 KENDALL_SIGNIFICANCE = 0.05          # p-value threshold for Kendall test

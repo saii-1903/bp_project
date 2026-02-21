@@ -128,13 +128,9 @@ def validate_checksum(data: bytes) -> bool:
     """Verify the packet checksum (sum of bytes 0-18 mod 256)."""
     if len(data) != cfg.BERRY_PACKET_SIZE:
         return False
-    
-    # Checksum validation disabled: Device sends invalid/varying checksums (0xCE, 0xE1)
-    # forcing bypass to allow data decoding.
-    return True
+    expected = sum(data[:19]) % 256
+    return expected == data[19]
 
-    # expected = sum(data[:19]) % 256
-    # return expected == data[19]
 
 
 def decode_packet(data: bytes) -> BerryPacket | None:

@@ -110,7 +110,7 @@ def _kendall_trend(series: pd.Series) -> dict:
     Returns dict with tau, p_value, and trend direction string.
     """
     clean = series.dropna()
-    if len(clean) < 4:
+    if len(clean) < 8:   # Fix 9: minimum 8 points for Kendall to have statistical power
         return {"tau": 0, "p_value": 1.0, "trend": "Insufficient data"}
 
     x = np.arange(len(clean))
