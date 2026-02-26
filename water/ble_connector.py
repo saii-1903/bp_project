@@ -56,6 +56,8 @@ class BerryBLEConnector:
         # Stats
         self.packets_received = 0
         self.packets_bad = 0
+        self.packets_lost = 0
+        self.last_packet_index = -1  # 0-255 tracking
 
     # ─── Public API ──────────────────────────────────────────────────
 
@@ -171,7 +173,7 @@ class BerryBLEConnector:
             self._set_state(STATE_CONNECTED)
 
             # Set desired packet rate
-            await self._async_send(cfg.BERRY_CMD_200HZ)
+            await self._async_send(cfg.BERRY_CMD_100HZ)
             await asyncio.sleep(0.1)
 
             # Subscribe to notifications
@@ -185,17 +187,15 @@ class BerryBLEConnector:
             # Keep running until stop
             # We cycle commands to keep the device awake (bypass 40s sleep timer)
             last_ping = time.time()
-            ping_tiggle = False
             
             while not self._stop_event.is_set() and self._client.is_connected:
-                if time.time() - last_ping > 1.5:
-                    # Fix 7: Use CMD_SW_VERSION as keep-alive ping.
-                    # It's a true no-op (returns a version string only) and
-                    # won't interrupt streaming or change the device's 200Hz state.
+                # Fix 7: Use CMD_SW_VERSION as keep-alive ping every 5 seconds.
+                # Throttled to prevent saturating the write characteristic.
+                if time.time() - last_ping > 5.0:
                     await self._async_send(cfg.BERRY_CMD_SW_VERSION)
-
+                    last_ping = time.time()
                     
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.5)
 
             # Cleanup
             try:
@@ -221,6 +221,11 @@ class BerryBLEConnector:
         """Handle incoming BLE notifications."""
         # Add to reassembly buffer
         self._buffer.extend(data)
+        
+        # Guard against buffer bloat if sync is lost
+        if len(self._buffer) > 1000:
+            self._buffer.clear()
+            return
 
         # Process complete packets
         while len(self._buffer) >= cfg.BERRY_PACKET_SIZE:
@@ -232,15 +237,19 @@ class BerryBLEConnector:
                     break
 
             if header_pos < 0:
-                # No header found, discard
-                self._buffer.clear()
+                # No header found. However, the last byte might be a partial header (0xFF).
+                # Keep only the last byte if it's 0xFF, otherwise clear.
+                if len(self._buffer) > 0 and self._buffer[-1] == 0xFF:
+                    del self._buffer[:-1]
+                else:
+                    self._buffer.clear()
                 break
 
             # Discard bytes before header
             if header_pos > 0:
                 del self._buffer[:header_pos]
 
-            # Need at least 20 bytes from header
+            # Need at least 20 bytes from header to process a full packet
             if len(self._buffer) < cfg.BERRY_PACKET_SIZE:
                 break
 
@@ -258,6 +267,23 @@ class BerryBLEConnector:
             pkt = decode_packet(raw)
             if pkt:
                 self.packets_received += 1
+                
+                # --- NEW: Packet Loss Detection & Duplicate Filter ---
+                if self.last_packet_index != -1:
+                    if pkt.packet_index == self.last_packet_index:
+                        # Duplicate packet — occasionally happens on some BLE stacks/Windows
+                        continue 
+                        
+                    expected = (self.last_packet_index + 1) % 256
+                    if pkt.packet_index != expected:
+                        # Real Gap detected!
+                        gap = (pkt.packet_index - expected) % 256
+                        self.packets_lost += gap
+                        print(f"BLE LOSS: Gap of {gap} packets detected! (Index: {self.last_packet_index} -> {pkt.packet_index})")
+                
+                self.last_packet_index = pkt.packet_index
+                # ----------------------------------
+
                 try:
                     self.packet_queue.put_nowait(pkt)
                 except queue.Full:
@@ -297,7 +323,9 @@ class BerryBLEConnector:
                 # If user did not ask to stop, wait and retry (auto-reconnect)
                 if not self._stop_event.is_set():
                     self._set_state(STATE_CONNECTING)
-                    time.sleep(1.0) # Wait before retry
+                    # Use a 3-second retry delay (backoff) to prevent infinite rapid polling
+                    # if the device is permanently out of range or off.
+                    time.sleep(3.0) 
 
         finally:
             # Safely shut down

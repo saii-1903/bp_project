@@ -8,7 +8,8 @@ are defined here for easy tuning and reproducibility.
 import os
 
 # ─── Sampling & Timing ───────────────────────────────────────────────
-SAMPLING_RATE_HZ = 200                # PPG sensor sampling rate
+SAMPLING_RATE_HZ = 100              # Incoming PPG sensor sampling rate
+MODEL_SAMPLING_RATE_HZ = 120        # ML Models expect 120Hz (Pipeline will upsample)
 SIMULATION_DURATION_MINUTES = 60     # Total simulated duration
 MEASUREMENT_DURATION_SECONDS = 30    # Active PPG collection phase
 CONNECTION_DELAY_SECONDS = 10        # Expected initial link delay
@@ -46,7 +47,7 @@ BANDPASS_RIPPLE_DB = 0.1             # Passband ripple
 BANDPASS_ATTENUATION_DB = 40         # Stopband attenuation
 
 # ─── Feature Extraction ─────────────────────────────────────────────
-FEATURE_WINDOW_SECONDS = 30          # Window size for aggregated features
+FEATURE_WINDOW_SECONDS = 36          # Ensures 3600 samples at 100Hz (Model wants 3600 @ 120Hz / 30s)
 FEATURE_WINDOW_OVERLAP = 0.5         # 50 % overlap between windows
 MIN_PEAKS_PER_WINDOW = 5             # Minimum beats to accept a window
 PEAK_DISTANCE_SAMPLES = 20           # Minimum distance between peaks
@@ -63,6 +64,10 @@ HI_FULLY_HYDRATED = 0               # HI >= 0
 HI_MILD_DEHYDRATION = -10           # -10 <= HI < 0
 HI_MODERATE_DEHYDRATION = -25       # -25 <= HI < -10
 HI_EXTREME_DEHYDRATION = -40        # HI < -25
+
+# ─── BP Physio Clamps ───────────────────────────────────────────────
+BP_SBP_LIMITS = (70, 220)
+BP_DBP_LIMITS = (40, 130)
 
 # ─── Visualisation ───────────────────────────────────────────────────
 OUTPUT_DIR = "output"
@@ -112,7 +117,7 @@ BERRY_CMD_STOP = 0xF6
 BERRY_CMD_SW_VERSION = 0xFF
 BERRY_CMD_HW_VERSION = 0xFE
 
-BERRY_DEFAULT_RATE_HZ = 200          # Device sampling rate
+BERRY_DEFAULT_RATE_HZ = 100          # Device sampling rate
 
 # Invalid-value sentinels
 BERRY_SPO2_INVALID = 127
@@ -121,13 +126,16 @@ BERRY_PI_INVALID = 0
 BERRY_RR_INVALID = 0
 
 # ─── Model Paths ───────────────────────────────────────────────────
-MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modelss")
 BP_MODEL_CONFIG = {
     "classifier": os.path.join(MODEL_DIR, "classifier.pkl"),
     "global_scaler": os.path.join(MODEL_DIR, "global_feature_scaler.pkl"),
     "hypo": os.path.join(MODEL_DIR, "hypo_models.pkl"),
     "normal": os.path.join(MODEL_DIR, "normal_models.pkl"),
     "hyper": os.path.join(MODEL_DIR, "hyper_models.pkl"),
+    "scaler_hypo": os.path.join(MODEL_DIR, "scaler_hypo.pkl"),
+    "scaler_normal": os.path.join(MODEL_DIR, "scaler_normal.pkl"),
+    "scaler_hyper": os.path.join(MODEL_DIR, "scaler_hyper.pkl"),
 }
 HB_GLU_MODEL_CONFIG = {
     "hb_scaler": os.path.join(MODEL_DIR, "scaler_hb.pkl"),
@@ -138,8 +146,8 @@ HB_GLU_MODEL_CONFIG = {
 
 # ─── Dashboard Settings ────────────────────────────────────────────
 DASHBOARD_WIDTH = 1400
-DASHBOARD_HEIGHT = 850
+DASHBOARD_HEIGHT = 950
 DASHBOARD_POLL_MS = 50               # GUI queue-poll interval
 LIVE_WAVEFORM_SECONDS = 10           # Rolling PPG window
 LIVE_WAVEFORM_MAX_POINTS = 500       # Max points in waveform graph
-SIMULATION_SPEED_HZ = 200            # Simulation packet rate (match device)
+SIMULATION_SPEED_HZ = 100            # Simulation packet rate (match device)

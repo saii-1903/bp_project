@@ -5,9 +5,9 @@ import numpy as np
 from scipy.signal import resample
 
 # CONFIGURATION
-INPUT_FOLDER = "old_data_120hz"   # Folder where your old JSONs are
-OUTPUT_FOLDER = "training_data"   # Folder where you will put ALL data (Old + New)
-OLD_FS = 120                      # Your old sampling rate
+INPUT_FOLDER = "hyperonly_training_data_200hz"   # Folder where your old JSONs are
+OUTPUT_FOLDER = "training_data_100hz"   # Folder where you will put ALL data (Old + New)
+OLD_FS = 200                      # Your old sampling rate
 NEW_FS = 100                      # Your new Berry device sampling rate
 
 def resample_file(file_path):

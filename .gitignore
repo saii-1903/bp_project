@@ -26,3 +26,12 @@ test_out.txt
 # Misc
 *.csv
 *.pdf
+
+# Extra ignores from user request
+data/
+output/
+logs/
+models/
+modelsky/
+!water/modelss/
+.antigravityignore

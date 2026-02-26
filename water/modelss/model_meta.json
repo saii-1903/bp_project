@@ -1,0 +1,21 @@
+{
+  "n_features": 31,
+  "groups": [
+    "hypo",
+    "normal",
+    "hyper"
+  ],
+  "label_to_int": {
+    "hypo": 0,
+    "normal": 1,
+    "hyper": 2
+  },
+  "int_to_label": {
+    "0": "hypo",
+    "1": "normal",
+    "2": "hyper"
+  },
+  "classifier_uses_int_labels": true,
+  "uses_meta_ridge": true,
+  "uses_per_group_scaler": true
+}

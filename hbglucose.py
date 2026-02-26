@@ -101,7 +101,8 @@ def extract_features(signal, fs=FS):
         top_freqs[1], top_mags[1],
         top_freqs[2], top_mags[2],
         hrv_std,
-        np.mean(signal), np.std(signal), np.max(signal), np.min(signal)
+        # indices 16-19: normalised signal stats (scale-invariant across sensors)
+        np.mean(norm), np.std(norm), np.max(norm), np.min(norm)
     ]
 
     # Fix 7: SpO2-inspired perfusion ratio features (Beer-Lambert Law basis)
@@ -272,7 +273,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train Hb and Glucose regressors from PPG JSON data")
     parser.add_argument("input_dir", help="Folder with training JSON files")
-    parser.add_argument("--model-dir", default="./model_output",
+    parser.add_argument("--model-dir", default="water/models",
                         help="Folder to save model files")
     parser.add_argument("--min-samples", type=int, default=10)
     args = parser.parse_args()

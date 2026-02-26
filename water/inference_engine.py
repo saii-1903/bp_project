@@ -2,8 +2,11 @@
 inference_engine.py — Unified model inference for BP, Hb, and Glucose.
 
 Feature vectors are matched EXACTLY to the training scripts:
-  BP  (25 features) → dangerr.py  extract_features()
-  Hb/Glu (20 features) → hbglucose.py  extract_cycle_features()
+  BP  (31 features) → dangerr_v2.py  extract_features()
+  Hb/Glu (27 features) → hbglucose.py  extract_cycle_features()
+
+BP classifier is loaded as a bundle dict (dangerr_v2 format):
+  {"model": clf, "label_to_int": {...}, "int_to_label": {...}}
 """
 
 import os
@@ -11,12 +14,103 @@ import joblib
 import numpy as np
 from scipy.signal import find_peaks, butter, filtfilt, resample
 from scipy.fft import fft
+from scipy.stats import iqr
+from collections import Counter
 import config as cfg
+
+
+class GenericTrendTracker:
+    """
+    Accumulates successive readings and returns a session trend.
+    """
+    def __init__(self, window=5, threshold=1.0):
+        self._history = []
+        self._window = window
+        self._threshold = threshold
+
+    def update(self, value):
+        if value is None or np.isnan(value):
+            return
+        self._history.append(value)
+
+    def get_trend(self):
+        n = len(self._history)
+        if n < 2:
+            return {"trend": "Stable →", "slope": 0.0, "readings": n}
+
+        arr = np.array(self._history[-self._window:])
+        x = np.arange(len(arr))
+        slope = float(np.polyfit(x, arr, 1)[0])
+
+        if slope > self._threshold:
+            trend = "Rising ↑"
+        elif slope < -self._threshold:
+            trend = "Falling ↓"
+        else:
+            trend = "Stable →"
+
+        return {
+            "trend": trend,
+            "slope": round(slope, 2),
+            "latest": self._history[-1],
+            "readings": n,
+        }
+
+class BPTrendTracker:
+    """
+    Accumulates successive BP predictions and returns a session trend.
+    """
+    def __init__(self, window=5):
+        self._sbp_history = []
+        self._dbp_history = []
+        self._cat_history = []
+        self._window = window
+
+    def update(self, data_or_sbp, dbp=None, category=None):
+        if isinstance(data_or_sbp, dict):
+            sbp = data_or_sbp.get("sbp")
+            dbp = data_or_sbp.get("dbp")
+            category = data_or_sbp.get("bp_category")
+        else:
+            sbp = data_or_sbp
+
+        if sbp is None or dbp is None or np.isnan(sbp) or np.isnan(dbp):
+            return
+        self._sbp_history.append(sbp)
+        self._dbp_history.append(dbp)
+        self._cat_history.append(category or "unknown")
+
+    def get_trend(self):
+        n = len(self._sbp_history)
+        if n < 2:
+            return {"trend": "Stable", "slope": 0.0, "readings": n}
+
+        sbp_arr = np.array(self._sbp_history[-self._window:])
+        x = np.arange(len(sbp_arr))
+        sbp_slope = float(np.polyfit(x, sbp_arr, 1)[0])
+
+        if sbp_slope > 1.0:
+            trend = "Rising ↑"
+        elif sbp_slope < -1.0:
+            trend = "Falling ↓"
+        else:
+            trend = "Stable →"
+
+        cats = [c for c in self._cat_history[-self._window:] if c]
+        latest_cat = Counter(cats).most_common(1)[0][0] if cats else "Normal"
+
+        return {
+            "trend": trend,
+            "slope": round(sbp_slope, 2),
+            "latest_sbp": self._sbp_history[-1],
+            "current_category": latest_cat,
+            "readings": n,
+        }
 
 
 class VitalInferenceEngine:
     def __init__(self):
-        self.fs = cfg.SAMPLING_RATE_HZ
+        self.fs = cfg.MODEL_SAMPLING_RATE_HZ  # Models expect 120Hz
         self.models = self._load_all_models()
 
     # ─── Model Loading ───────────────────────────────────────────────────
@@ -25,15 +119,30 @@ class VitalInferenceEngine:
         models = {}
         try:
             # BP classifier + group-specific regression models
+            # dangerr_v2 saves the classifier as a bundle dict:
+            #   {"model": clf, "label_to_int": {...}, "int_to_label": {...}}
             if os.path.exists(cfg.BP_MODEL_CONFIG["classifier"]):
-                models["bp_classifier"]    = joblib.load(cfg.BP_MODEL_CONFIG["classifier"])
+                _clf_bundle = joblib.load(cfg.BP_MODEL_CONFIG["classifier"])
+                if isinstance(_clf_bundle, dict):
+                    models["bp_classifier"]   = _clf_bundle["model"]
+                    models["bp_int_to_label"] = _clf_bundle.get("int_to_label", {0:"hypo",1:"normal",2:"hyper"})
+                    models["bp_label_to_int"] = _clf_bundle.get("label_to_int", {"hypo":0,"normal":1,"hyper":2})
+                else:
+                    # Legacy: raw classifier object (old dangerr.py models)
+                    models["bp_classifier"]   = _clf_bundle
+                    models["bp_int_to_label"] = {0:"hypo", 1:"normal", 2:"hyper"}
+                    models["bp_label_to_int"] = {"hypo":0, "normal":1, "hyper":2}
                 models["bp_global_scaler"] = joblib.load(cfg.BP_MODEL_CONFIG["global_scaler"])
                 for group in ["hypo", "normal", "hyper"]:
                     path = cfg.BP_MODEL_CONFIG[group]
-                    if os.path.exists(path):
+                    scl_path = cfg.BP_MODEL_CONFIG.get(f"scaler_{group}")
+                    if os.path.exists(path) and scl_path and os.path.exists(scl_path):
                         g = joblib.load(path)
                         models[f"bp_{group}_sbp"] = g["sbp_model"]
                         models[f"bp_{group}_dbp"] = g["dbp_model"]
+                        models[f"bp_{group}_sbp_meta"] = g.get("sbp_meta")
+                        models[f"bp_{group}_dbp_meta"] = g.get("dbp_meta")
+                        models[f"bp_scaler_{group}"] = joblib.load(scl_path)
 
             # Hb / Glucose
             if os.path.exists(cfg.HB_GLU_MODEL_CONFIG["hb_model"]):
@@ -59,11 +168,19 @@ class VitalInferenceEngine:
         """Simple noise gate — rejects flat or clipped segments."""
         return np.std(sig) < 1e-4 or np.max(sig) - np.min(sig) < 0.01
 
+    def _iqr_filter(self, values, factor=1.5):
+        """Return a boolean mask of inliers using IQR method."""
+        if len(values) < 4:
+            return np.ones(len(values), dtype=bool)
+        q1, q3 = np.percentile(values, 25), np.percentile(values, 75)
+        iq = q3 - q1
+        return (np.array(values) >= q1 - factor * iq) & (np.array(values) <= q3 + factor * iq)
+
     # ─── BP Feature Extraction (matches dangerr.py exactly) ─────────────
 
-    def _bp_features(self, ppg_seg):
+    def _bp_features(self, ppg_seg, pr_seg=None):
         """
-        25-feature vector identical to dangerr.py extract_features().
+        31-feature vector identical to dangerr_v2.py extract_features().
         Returns None if signal is unusable.
         """
         if len(ppg_seg) < self.fs or self._is_noisy(ppg_seg):
@@ -108,10 +225,17 @@ class VitalInferenceEngine:
         m_top = list(fft_vals[pks][top_idx]) if len(top_idx) >= 3 else [0.0, 0.0, 0.0]
 
         # HRV + PR
-        ibi    = np.diff(peaks) / self.fs if len(peaks) > 1 else np.array([0.0])
-        hrv    = float(np.std(ibi))
-        pr_mean = float(60.0 / np.mean(ibi)) if np.mean(ibi) > 0 else 70.0
-        pr_std  = float(np.std(60.0 / ibi))  if len(ibi) > 1 else 2.0
+        ibi = np.diff(peaks) / self.fs if len(peaks) > 1 else np.array([0.0])
+        hrv = float(np.std(ibi))
+
+        # PR stats (Fix: use pr_seg if available)
+        if pr_seg is not None and len(pr_seg) > 0:
+            pr_mean = float(np.nanmean(pr_seg)) if not np.all(np.isnan(pr_seg)) else 0.0
+            pr_std  = float(np.nanstd(pr_seg))  if not np.all(np.isnan(pr_seg)) else 2.0
+            if pr_std < 0.1: pr_std = 2.0
+        else:
+            pr_mean = float(60.0 / np.mean(ibi)) if np.mean(ibi) > 0 else 70.0
+            pr_std  = float(np.std(60.0 / ibi))  if len(ibi) > 1 else 2.0
 
         # 25 features + 6 new vascular/HRV features = 31 total (matches danger.py)
         # ── Fix 4: new vascular / HRV features ──────────────────────────
@@ -144,10 +268,10 @@ class VitalInferenceEngine:
             *f_top,             # 12-14
             *m_top,             # 15-17
             float(hrv),         # 18
-            float(np.mean(ppg_filt)),  # 19
-            float(np.std(ppg_filt)),   # 20
-            float(np.max(ppg_filt)),   # 21
-            float(np.min(ppg_filt)),   # 22
+            float(np.mean(norm)),  # 19
+            float(np.std(norm)),   # 20
+            float(np.max(norm)),   # 21
+            float(np.min(norm)),   # 22
             pr_mean,            # 23
             pr_std,             # 24
             ri,                 # 25 Reflection Index
@@ -206,6 +330,12 @@ class VitalInferenceEngine:
         ibi_list = np.diff(peaks) / self.fs if len(peaks) > 1 else [0.0]
         hrv_std  = float(np.std(ibi_list)) if len(ibi_list) > 1 else 0.0
 
+        # Normalise ppg_filt to 0-1 range for features 16-19.
+        # Raw ppg_filt absolute values are sensor-dependent (ADCSample ~620k vs
+        # PlethWave 1-100). Normalising makes these features scale-invariant and
+        # consistent with the normalized signal used for all other features.
+        _pf_norm = (ppg_filt - ppg_filt.min()) / (ppg_filt.max() - ppg_filt.min() + 1e-6)
+
         features = [
             float(np.max(cycle)), float(pw), float(ttp), float(ratio),
             float(np.max(d1)), float(np.min(d1)), float(np.max(d2)), float(np.min(d2)),
@@ -214,9 +344,9 @@ class VitalInferenceEngine:
             float(top_freqs[1]), float(top_mags[1]),
             float(top_freqs[2]), float(top_mags[2]),
             hrv_std,
-            # indices 16-19: raw filtered signal stats (matches hbglucose.py training)
-            float(np.mean(ppg_filt)), float(np.std(ppg_filt)),
-            float(np.max(ppg_filt)),  float(np.min(ppg_filt)),
+            # indices 16-19: normalised signal stats (scale-invariant across sensors)
+            float(np.mean(_pf_norm)), float(np.std(_pf_norm)),
+            float(np.max(_pf_norm)),  float(np.min(_pf_norm)),
         ]
 
         # Additional optical/shape features (indices 20-26) — same as hbglucose.py
@@ -284,10 +414,12 @@ class VitalInferenceEngine:
         age: float = None,
         gender: str = None,   # 'Male' / 'Female' / None
         bmi: float = None,
+        pr_all_data: list = None,
+        offsets: dict = None,  # Expect dict like {'sbp': 10, 'dbp': -5, 'hb': 0.5, 'glucose': 20}
     ):
         """
         Run all models on a PPG segment and return vitals.
-        Pass age/gender/bmi so Hb & Glucose feature vectors match training.
+        Pass age/gender/bmi/pr_all_data so feature vectors match training.
         """
 
         from scipy.signal import medfilt as _medfilt
@@ -295,23 +427,32 @@ class VitalInferenceEngine:
 
         ppg_segment = np.array(ppg_segment, dtype=float)
 
-        # ── Resample to canonical rate (200 Hz) ──────────────────────────
+        # ── Resample to model rate (120 Hz) ──────────────────────────
         src_rate = actual_rate_hz if actual_rate_hz else cfg.SAMPLING_RATE_HZ
         n_src    = len(ppg_segment)
         duration = n_src / src_rate
-        n_target = int(round(duration * cfg.SAMPLING_RATE_HZ))
-        if n_target < int(cfg.SAMPLING_RATE_HZ * 2):
+        
+        # We ALWAYS want to end up at MODEL_SAMPLING_RATE_HZ (120Hz)
+        n_target = int(round(duration * cfg.MODEL_SAMPLING_RATE_HZ))
+        
+        if n_target < int(cfg.MODEL_SAMPLING_RATE_HZ * 2):
             print(f"DEBUG: segment too short ({duration:.1f}s) — skipping")
             return None
+            
         if n_target != n_src:
             ppg_segment = resample(ppg_segment, n_target)
+            # Update internal fs for this prediction if it differs from the global one
+            # though self.fs is usually already 120.
+            current_fs = cfg.MODEL_SAMPLING_RATE_HZ
+        else:
+            current_fs = src_rate
 
         results = {}
 
         # 1. Blood Pressure — segment-wise (dangerr.py approach) ─────────
         try:
-            FS       = cfg.SAMPLING_RATE_HZ                  # 200
-            SEG_LEN  = FS * 5                                 # 1000 samples / 5 s
+            FS       = cfg.MODEL_SAMPLING_RATE_HZ            # 120
+            SEG_LEN  = FS * 5                                 # 600 samples / 5 s
             SEGMENTS = 6                                      # need 6 segments → 30 s
 
             if len(ppg_segment) < FS * 30:
@@ -319,66 +460,101 @@ class VitalInferenceEngine:
             elif "bp_classifier" not in self.models:
                 print("DEBUG BP: models not loaded")
             else:
-                # Pre-process exactly like dangerr.py line 183
-                ppg_med = _medfilt(ppg_segment, kernel_size=3)
+                # Resolve PR data
+                pr_arr = None
+                if pr_all_data and len(pr_all_data) > 0:
+                    pr_arr = np.array(pr_all_data, dtype=float)
+                    pr_arr[(pr_arr == 0) | (pr_arr == 127) | (pr_arr == 255)] = np.nan
+                
+                if pr_arr is None or np.count_nonzero(~np.isnan(pr_arr)) < 6:
+                    # Generic PR mean if device data is missing
+                    pr_arr = np.full(6, 75.0)
 
+                ppg_med = _medfilt(ppg_segment, kernel_size=3)
                 seg_predictions = []
+
                 for i in range(SEGMENTS):
                     seg = ppg_med[i * SEG_LEN : (i + 1) * SEG_LEN]
-                    feat = self._bp_features(seg)
+                    # Map 30s PR array (1Hz) to 5s segment → 5 values per segment
+                    # pr_arr[i*5 : (i+1)*5] gives 5 per-second HR readings per 5s window,
+                    # enabling a real pr_std instead of always clamping to 2.0.
+                    pr_seg = pr_arr[i*5 : (i+1)*5] if len(pr_arr) >= 30 else pr_arr if len(pr_arr) >= 6 else np.array([75.0])
+                    
+                    feat = self._bp_features(seg, pr_seg)
                     if feat is None:
                         continue
 
-                    X = self.models["bp_global_scaler"].transform(
-                        np.array(feat, dtype=float).reshape(1, -1)
-                    )
-                    probs   = self.models["bp_classifier"].predict_proba(X)[0]
+                    X_raw = np.array(feat, dtype=float).reshape(1, -1)
+                    
+                    # 1. Classification (Global Scaler)
+                    X_cls = self.models["bp_global_scaler"].transform(X_raw)
+                    probs = self.models["bp_classifier"].predict_proba(X_cls)[0]
                     classes = self.models["bp_classifier"].classes_
 
-                    # DEBUG: see what individual models are thinking
-                    prob_dict = dict(zip(classes, np.round(probs, 3)))
-                    if i == 0: # Print only for the first segment to avoid log flooding
-                         print(f"DEBUG: Segment 0 Probs: {prob_dict}")
-
-                    # Soft vote: weighted sum across all groups
+                    # 2. Regression (Soft Vote with Per-Group Scalers + Meta Ridge)
+                    # classes_ may be integers [0,1,2] (dangerr_v2) or strings (legacy).
+                    # Always resolve to string group names for model dict key lookup.
+                    int_to_label = self.models.get("bp_int_to_label", {0:"hypo",1:"normal",2:"hyper"})
                     w_sbp = w_dbp = 0.0
-                    for idx, cls_name in enumerate(classes):
+                    for idx, cls_raw in enumerate(classes):
                         p = probs[idx]
-                        key_sbp = f"bp_{cls_name}_sbp"
-                        key_dbp = f"bp_{cls_name}_dbp"
-                        if key_sbp in self.models:
-                            s_pred = float(self.models[key_sbp].predict(X)[0])
-                            d_pred = float(self.models[key_dbp].predict(X)[0])
-                            if i == 0:
-                                print(f"  -> Model {cls_name}: SBP={s_pred:.1f}, DBP={d_pred:.1f} (p={p:.2f})")
+                        cls_name = int_to_label.get(cls_raw, str(cls_raw))  # 0→"hypo" etc.
+                        scl_key = f"bp_scaler_{cls_name}"
+                        sbp_key = f"bp_{cls_name}_sbp"
+                        dbp_key = f"bp_{cls_name}_dbp"
+                        sbp_meta_key = f"bp_{cls_name}_sbp_meta"
+                        dbp_meta_key = f"bp_{cls_name}_dbp_meta"
+
+                        if scl_key in self.models and sbp_key in self.models:
+                            X_reg = self.models[scl_key].transform(X_raw)
+                            s_pred = float(self.models[sbp_key].predict(X_reg)[0])
+                            d_pred = float(self.models[dbp_key].predict(X_reg)[0])
+
+                            # Meta Ridge Correction (Fix 3)
+                            if sbp_meta_key in self.models and self.models[sbp_meta_key]:
+                                s_pred = float(self.models[sbp_meta_key].predict([[s_pred]])[0])
+                                d_pred = float(self.models[dbp_meta_key].predict([[d_pred]])[0])
+
                             w_sbp += p * s_pred
                             w_dbp += p * d_pred
 
-                    label = classes[np.argmax(probs)]
-                    seg_predictions.append((w_sbp, w_dbp, label))
+                    _raw_label = classes[np.argmax(probs)]
+                    label_top = int_to_label.get(_raw_label, str(_raw_label))
+                    seg_predictions.append({
+                        "sbp": w_sbp, "dbp": w_dbp, "label": label_top, 
+                        "conf": float(np.max(probs))
+                    })
 
                 if len(seg_predictions) < 3:
-                    print(f"DEBUG BP: only {len(seg_predictions)} valid segments — need >=3")
+                     print(f"DEBUG BP: only {len(seg_predictions)} valid segments — need >=3")
                 else:
-                    sbp_vals = [p[0] for p in seg_predictions]
-                    dbp_vals = [p[1] for p in seg_predictions]
-                    sbp_med  = np.median(sbp_vals)
-                    dbp_med  = np.median(dbp_vals)
+                    # IQR Outlier Filtering (Fix 4)
+                    sbp_list = [r["sbp"] for r in seg_predictions]
+                    dbp_list = [r["dbp"] for r in seg_predictions]
+                    sbp_mask = self._iqr_filter(sbp_list)
+                    dbp_mask = self._iqr_filter(dbp_list)
+                    mask = sbp_mask & dbp_mask
 
-                    bad_sbp = sum(abs(v - sbp_med) > 10 for v in sbp_vals)
-                    bad_dbp = sum(abs(v - dbp_med) > 10 for v in dbp_vals)
-                    if bad_sbp >= 3 or bad_dbp >= 3:
-                        print(f"DEBUG BP: inconsistent segments (bad SBP={bad_sbp}, DBP={bad_dbp})")
-                    else:
-                        # Fix 4: clamp BP into a physiologically realistic range
-                        final_sbp = float(np.clip(np.mean(sbp_vals), 70, 200))
-                        final_dbp = float(np.clip(np.mean(dbp_vals), 40, 130))
-                        category  = Counter([p[2] for p in seg_predictions]).most_common(1)[0][0]
+                    if mask.sum() < 2:
+                        mask = np.ones(len(seg_predictions), dtype=bool)
 
-                        results["sbp"]         = round(final_sbp, 1)
-                        results["dbp"]         = round(final_dbp, 1)
-                        results["bp_category"] = category
-                        print(f"DEBUG BP: SBP={results['sbp']} DBP={results['dbp']} ({category})")
+                    clean_sbp = [sbp_list[i] for i, m in enumerate(mask) if m]
+                    clean_dbp = [dbp_list[i] for i, m in enumerate(mask) if m]
+                    clean_labels = [seg_predictions[i]["label"] for i, m in enumerate(mask) if m]
+
+                    # Final Clamp & Result (Fix 7)
+                    f_sbp = float(np.clip(np.mean(clean_sbp), *cfg.BP_SBP_LIMITS))
+                    f_dbp = float(np.clip(np.mean(clean_dbp), *cfg.BP_DBP_LIMITS))
+                    category = Counter(clean_labels).most_common(1)[0][0]
+
+                    if offsets:
+                        f_sbp += offsets.get('sbp', 0.0)
+                        f_dbp += offsets.get('dbp', 0.0)
+
+                    results["sbp"] = round(f_sbp, 1)
+                    results["dbp"] = round(f_dbp, 1)
+                    results["bp_category"] = category
+                    print(f"DEBUG BP: SBP={results['sbp']} DBP={results['dbp']} ({category}) (Offsets: {offsets})")
 
 
         except Exception as e:
@@ -400,8 +576,11 @@ class VitalInferenceEngine:
                 X_hb = self.models["hb_scaler"].transform(
                     np.array(hg_raw + demo, dtype=float).reshape(1, -1)
                 )
-                results["hb"] = round(float(self.models["hb_model"].predict(X_hb)[0]), 2)
-                print(f"DEBUG Hb: {results['hb']} g/dL")
+                raw_hb = float(self.models["hb_model"].predict(X_hb)[0])
+                if offsets:
+                    raw_hb += offsets.get('hb', 0.0)
+                results["hb"] = round(raw_hb, 2)
+                print(f"DEBUG Hb: {results['hb']} g/dL (Offset: {offsets.get('hb',0) if offsets else 0})")
         except Exception as e:
             print(f"DEBUG Hb error: {e}")
 
@@ -417,8 +596,10 @@ class VitalInferenceEngine:
                     np.array(hg_raw + demo, dtype=float).reshape(1, -1)
                 )
                 glu = float(self.models["glucose_model"].predict(X_glu)[0])
+                if offsets:
+                    glu += offsets.get('glucose', 0.0)
                 results["glucose"] = round(max(40.0, min(400.0, glu)), 1)
-                print(f"DEBUG Glu: {results['glucose']} mg/dL")
+                print(f"DEBUG Glu: {results['glucose']} mg/dL (Offset: {offsets.get('glucose',0) if offsets else 0})")
         except Exception as e:
             print(f"DEBUG Glucose error: {e}")
 

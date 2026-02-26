@@ -34,6 +34,7 @@ class BerryPacket:
     adc_sample: int         # Signed int32 IR ADC sample
     battery: int            # Battery percentage (0-100)
     packet_freq: int        # Current packet rate (1/50/100/200 Hz)
+    raw_hex: str = ""       # Raw 20-byte payload as hex string
 
     # ─── Derived Properties ──────────────────────────────────────────
 
@@ -172,6 +173,7 @@ def decode_packet(data: bytes) -> BerryPacket | None:
         adc_sample=adc_sample,
         battery=data[17] & 0x7F,  # Mask high bit (some devices use bit 7 for status)
         packet_freq=data[18],
+        raw_hex=data.hex().upper(),
     )
 
 
